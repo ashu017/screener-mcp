@@ -71,6 +71,18 @@ export function parseCompanyId(root: HTMLElement): number | null {
   return id ? Number(id) : null;
 }
 
+/** The peers/alerts endpoints key off a separate "warehouse id" (data-warehouse-id),
+ * NOT the company id. e.g. TCS company id 3365 but warehouse id 6599230. */
+export function parseWarehouseId(root: HTMLElement): number | null {
+  const el = root.querySelector("[data-warehouse-id]");
+  const id = el?.getAttribute("data-warehouse-id");
+  if (id) return Number(id);
+  // Fallback: alerts data-url carries the same id, "/alerts/stock-6599230/".
+  const alert = root.querySelector("[data-url*='/alerts/stock-']");
+  const m = alert?.getAttribute("data-url")?.match(/\/alerts\/stock-(\d+)\//);
+  return m ? Number(m[1]) : null;
+}
+
 export function parseFundamentals(symbol: string, html: string, url: string): Fundamentals {
   const root = parse(html);
   const name = txt(root.querySelector("h1")) || symbol.toUpperCase();
@@ -143,43 +155,55 @@ export function parseFinancials(html: string): StatementTable[] {
 
 export interface PeersResult {
   peers: Peer[];
-  /** Screener lazy-loads the peer table via JS, so it is usually NOT present in
-   * the server-rendered HTML. When empty, `sector`/`note` explain why and the
-   * caller can fall back to get_financials / get_fundamentals of named peers. */
-  sector: string | null;
-  note?: string;
+  median: Record<string, string> | null;
 }
 
-export function parsePeers(html: string): PeersResult {
-  const root = parse(html);
-  const sector =
-    txt(root.querySelector("#peers .sub, section#peers p")) ||
-    txt(root.querySelector("[href*='/company/compare/']")) ||
-    null;
+/** Parse the peers HTML fragment returned by /api/company/{warehouseId}/peers/. */
+export function parsePeersFragment(fragmentHtml: string): PeersResult {
+  const root = parse(fragmentHtml);
+  const table = root.querySelector("table");
+  if (!table) return { peers: [], median: null };
 
-  const table = root.querySelector("#peers table, .peers table, section#peers table");
-  if (!table) {
-    return {
-      peers: [],
-      sector,
-      note: "Peer table is lazy-loaded by Screener's JS and not in the server-rendered HTML. Use the company's sector to identify peers and call get_fundamentals on them.",
-    };
-  }
-
-  const headers = table.querySelectorAll("thead th").map((th) => txt(th));
+  const headers = table.querySelectorAll("thead th, tr:first-child th").map((th) => txt(th));
   const peers: Peer[] = [];
   for (const tr of table.querySelectorAll("tbody tr")) {
     const cells = tr.querySelectorAll("td");
-    if (cells.length < 2) continue;
-    const name = txt(cells[1]) || txt(cells[0]);
+    if (cells.length < 3) continue;
+    // Column 0 is S.No, column 1 is the name (a link), rest are metrics.
+    const name = txt(cells[1]);
+    if (!name) continue;
+    const symbol = cells[1].querySelector("a")?.getAttribute("href")?.match(/\/company\/([^/]+)\//)?.[1];
     const values: Record<string, string> = {};
     cells.forEach((td, i) => {
       const key = headers[i] || `col${i}`;
-      values[key] = txt(td);
+      if (i >= 2) values[key] = txt(td);
     });
-    if (name && !/median/i.test(name)) peers.push({ name, values });
+    peers.push({ name: symbol ? `${symbol} (${name})` : name, values });
   }
-  return { peers, sector };
+
+  // The median row lives in tfoot.
+  let median: Record<string, string> | null = null;
+  const foot = table.querySelector("tfoot tr");
+  if (foot) {
+    const cells = foot.querySelectorAll("td");
+    median = {};
+    cells.forEach((td, i) => {
+      const key = headers[i] || `col${i}`;
+      if (i >= 2) median![key] = txt(td);
+    });
+  }
+
+  return { peers, median };
+}
+
+/** Fetch + parse the peer comparison. Needs the warehouse id (see parseWarehouseId)
+ * and the X-Requested-With header, else Screener 404s the fragment. */
+export async function fetchPeers(warehouseId: number): Promise<PeersResult> {
+  const res = await fetch(`${BASE}/api/company/${warehouseId}/peers/`, {
+    headers: { "User-Agent": UA, "X-Requested-With": "XMLHttpRequest" },
+  });
+  if (!res.ok) throw new Error(`Screener peers -> HTTP ${res.status}`);
+  return parsePeersFragment(await res.text());
 }
 
 /** JSON chart API — clean time-series. metric examples: "Price", "Quarter Sales", "EPS". */

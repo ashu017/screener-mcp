@@ -6,9 +6,10 @@ import {
   fetchCompanyHtml,
   parseFundamentals,
   parseFinancials,
-  parsePeers,
+  fetchPeers,
   fetchChart,
   parseCompanyId,
+  parseWarehouseId,
 } from "./screener.js";
 import { parse } from "node-html-parser";
 
@@ -61,7 +62,9 @@ server.tool(
   async ({ symbol }) => {
     try {
       const { html } = await fetchCompanyHtml(symbol);
-      return json(parsePeers(html));
+      const warehouseId = parseWarehouseId(parse(html));
+      if (!warehouseId) return err(`Could not resolve warehouse id for '${symbol}'`);
+      return json({ symbol: symbol.toUpperCase(), ...(await fetchPeers(warehouseId)) });
     } catch (e) {
       return err(e instanceof Error ? e.message : String(e));
     }

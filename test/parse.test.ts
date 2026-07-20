@@ -5,8 +5,9 @@ import { dirname, join } from "node:path";
 import {
   parseFundamentals,
   parseFinancials,
-  parsePeers,
   parseCompanyId,
+  parseWarehouseId,
+  fetchPeers,
 } from "../src/screener.js";
 import { parse } from "node-html-parser";
 
@@ -38,9 +39,16 @@ test("parses all statement sections with data", () => {
   expect(pl.rows.length).toBeGreaterThan(5);
 });
 
-test("peers returns graceful result when lazy-loaded", () => {
-  const r = parsePeers(html);
-  // Peer table is JS-lazy-loaded; expect the graceful note rather than a crash.
-  expect(Array.isArray(r.peers)).toBe(true);
-  if (r.peers.length === 0) expect(r.note).toBeTruthy();
+test("parses warehouse id (distinct from company id)", () => {
+  const wid = parseWarehouseId(parse(html));
+  expect(wid).toBe(6599230);
 });
+
+test("fetches and parses live peers (network)", async () => {
+  const wid = parseWarehouseId(parse(html));
+  const r = await fetchPeers(wid!);
+  expect(r.peers.length).toBeGreaterThan(2);
+  // TCS's peer set should include Infosys.
+  expect(r.peers.some((p) => /INFY|Infosys/i.test(p.name))).toBe(true);
+  expect(r.median).toBeTruthy();
+}, 20000);

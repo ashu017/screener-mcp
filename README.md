@@ -13,7 +13,7 @@ the chart tool uses Screener's JSON chart API.
 |---|---|---|
 | `get_fundamentals` | `symbol` | Key ratio cards (P/E, P/B, ROE, ROCE, Market Cap, Book Value, Dividend Yield, etc.), pros/cons, about |
 | `get_financials` | `symbol` | Statement tables: Quarterly Results, P&L, Balance Sheet, Cash Flow, Ratios, Shareholding |
-| `get_peers` | `symbol` | Peer comparison (see limitation below) + sector |
+| `get_peers` | `symbol` | Sector peer comparison table (CMP, P/E, Market Cap, Div Yield, NP, ROCE, sales growth) + sector median |
 | `get_chart` | `symbol`, `metric?`, `days?` | Time-series from the chart API. `metric` e.g. `Price-DMA50-Volume`, `Price`, `Quarter Sales`, `EPS` |
 
 `symbol` is the NSE/BSE trading symbol, e.g. `TCS`, `RELIANCE`, `MTARTECH`.
@@ -50,13 +50,13 @@ Add to your MCP config (`.mcp.json` or global), pointing at the built entry:
 
 Then an agent can call `get_fundamentals`, `get_financials`, `get_peers`, `get_chart`.
 
-## Known limitation: peers
+## How peers works
 
-Screener **lazy-loads the peer comparison table via JavaScript**, so it is not present
-in the server-rendered HTML. `get_peers` therefore returns the company's sector plus a
-note, and an empty `peers` array, rather than the full table. Recommended fallback: use
-the sector to identify peer symbols and call `get_fundamentals` on each. (A future
-version can capture the live peers endpoint via browser devtools and query it directly.)
+Screener lazy-loads the peer table from `GET /api/company/{warehouseId}/peers/` — note
+this uses a separate **warehouse id** (from `data-warehouse-id` on the page), *not* the
+company id, and requires the `X-Requested-With: XMLHttpRequest` header. `get_peers`
+resolves the warehouse id from the company page, fetches that fragment, and parses the
+comparison table plus the sector-median row.
 
 ## Testing
 
