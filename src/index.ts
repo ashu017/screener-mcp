@@ -10,8 +10,18 @@ import {
   fetchChart,
   parseCompanyId,
   parseWarehouseId,
+  parseQuarterlyResults,
+  parseRatios,
+  runScreen,
 } from "./screener.js";
 import { parse } from "node-html-parser";
+import { loadSession, sessionPath, whoami } from "./auth.js";
+import { runCli } from "./cli.js";
+
+// Subcommands (login/status/logout) run instead of the server. An MCP client
+// launches us with no arguments, so the server remains the default.
+const cliExit = await runCli(process.argv.slice(2));
+if (cliExit !== null) process.exit(cliExit);
 
 const server = new McpServer({
   name: "screener-mcp",
@@ -91,6 +101,85 @@ server.tool(
   },
 );
 
+server.tool(
+  "get_ratios",
+  "Typed NUMERIC fundamentals for an Indian stock (pe, pb, roe, roce, debtEquity, salesGrowth3yPct, profitGrowth3yPct, promoterHoldingPct, opmPctTtm, ...). Prefer this over get_fundamentals when you need to compare or compute — get_fundamentals returns display strings like '₹ 17,60,650 Cr.'. Banks/NBFCs get null debtEquity and salesGrowth3yPct by design; see the returned `caveats`.",
+  symbolArg,
+  async ({ symbol }) => {
+    try {
+      const { html } = await fetchCompanyHtml(symbol);
+      return json(parseRatios(symbol, html));
+    } catch (e) {
+      return err(e instanceof Error ? e.message : String(e));
+    }
+  },
+);
+
+server.tool(
+  "get_quarterly_results",
+  "Per-quarter Sales, Net Profit, EPS, Operating Profit and OPM for an Indian stock, keyed by the real quarter END date (ISO YYYY-MM-DD) rather than a display label like 'Jun 2026'. Use this instead of get_financials when you need to sort or join quarters by date. Anonymous access returns roughly the last 13 quarters.",
+  symbolArg,
+  async ({ symbol }) => {
+    try {
+      const { html } = await fetchCompanyHtml(symbol);
+      const quarters = parseQuarterlyResults(html);
+      if (quarters.length === 0) return err(`No quarterly results table found for '${symbol}'`);
+      return json({ symbol: symbol.toUpperCase(), quarters });
+    } catch (e) {
+      return err(e instanceof Error ? e.message : String(e));
+    }
+  },
+);
+
+server.tool(
+  "run_screen",
+  "Run a Screener.in screen and return the matching stocks. REQUIRES SIGN-IN (see screener_auth_status). `query` uses Screener's DSL, e.g. \"Return on capital employed > 15 AND Debt to equity < 1 AND Piotroski score >= 7 AND Market Capitalization > 5000\". Returns 50 rows per page; raise maxPages for more. Far cheaper than calling get_ratios per stock across a universe.",
+  {
+    query: z.string().describe("Screener DSL filter, e.g. 'Return on equity > 15 AND Debt to equity < 1'"),
+    maxPages: z.number().int().min(1).max(20).default(4).describe("Pages to fetch, 50 rows each"),
+    sort: z.string().optional().describe("Column name to sort by, e.g. 'Market Capitalization'"),
+    order: z.enum(["asc", "desc"]).optional().describe("Sort direction"),
+  },
+  async ({ query, maxPages, sort, order }) => {
+    try {
+      return json(await runScreen(query, { maxPages, sort, order }));
+    } catch (e) {
+      return err(e instanceof Error ? e.message : String(e));
+    }
+  },
+);
+
+server.tool(
+  "screener_auth_status",
+  "Check whether this server has a valid signed-in Screener.in session. Call this when a tool reports that it needs sign-in, then relay the returned instruction to the user.",
+  {},
+  async () => {
+    const s = loadSession();
+    if (!s) {
+      return json({
+        signedIn: false,
+        sessionFile: sessionPath(),
+        instruction:
+          "Not signed in. Ask the user to run `npx screener-mcp login` in a terminal, then retry. " +
+          "Only anonymous (public) Screener data is available until then.",
+      });
+    }
+    const who = await whoami(s.sessionId);
+    if (!who.valid) {
+      return json({
+        signedIn: false,
+        expired: true,
+        savedAt: s.savedAt,
+        instruction:
+          "The stored Screener session has expired. Ask the user to run `npx screener-mcp login` again.",
+      });
+    }
+    return json({ signedIn: true, account: who.username ?? s.username ?? null, savedAt: s.savedAt });
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("screener-mcp server running on stdio");
+console.error(
+  `screener-mcp server running on stdio (${loadSession() ? "signed in" : "anonymous — run `npx screener-mcp login` for account-only data"})`,
+);

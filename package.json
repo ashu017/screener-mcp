@@ -6,15 +6,29 @@
   "bin": {
     "screener-mcp": "dist/index.js"
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepare": "tsc",
+    "prepublishOnly": "npm run build"
   },
   "keywords": ["mcp", "screener", "india", "nse", "bse", "stocks", "fundamentals"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ashu017/screener-mcp.git"
+  },
+  "homepage": "https://github.com/ashu017/screener-mcp#readme",
+  "bugs": "https://github.com/ashu017/screener-mcp/issues",
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "node-html-parser": "^7.0.1",
