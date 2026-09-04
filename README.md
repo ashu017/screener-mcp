@@ -152,7 +152,8 @@ it as an env var (this takes precedence over the stored file):
 | `SCREENER_BROWSER_HEADLESS` | Run `--browser` headless. Only refreshes an already signed-in profile — it cannot complete a first-time sign-in |
 
 Use your own account only, and note that automated access to account-gated pages is subject
-to [Screener's terms](https://www.screener.in/terms/).
+to [Screener's terms](https://www.screener.in/guides/terms/), which license the site's
+material "for personal, non-commercial transitory viewing only".
 
 ## Local development
 

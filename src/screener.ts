@@ -21,7 +21,7 @@ export function isSignedIn(): boolean {
 
 /** Common headers. The session cookie rides along whenever we have one — Screener
  * serves richer data to logged-in users on the same URLs. */
-function headers(extra: Record<string, string> = {}): Record<string, string> {
+export function headers(extra: Record<string, string> = {}): Record<string, string> {
   const h: Record<string, string> = { "User-Agent": userAgent(), ...extra };
   const cookie = cookieHeader();
   if (cookie) h.Cookie = cookie;
