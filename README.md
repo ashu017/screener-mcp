@@ -73,26 +73,62 @@ To pin a version, use `screener-mcp@0.1.0`. To run straight from git without npm
 ## Signing in (optional)
 
 Screener serves more to logged-in accounts. Screener has no OAuth or API keys — it's a
-Django app, so being "signed in" means holding a `sessionid` cookie. To get one:
+Django app, so being "signed in" means holding a `sessionid` cookie. Two ways to get one:
 
 ```bash
-npx screener-mcp login     # prompts for email + password, no echo
-npx screener-mcp status    # is my session still valid?
-npx screener-mcp logout    # delete it
+npx screener-mcp login              # email + password, prompted with no echo
+npx screener-mcp login --browser    # sign in in a real browser window
+npx screener-mcp status             # is my session still valid?
+npx screener-mcp logout             # delete it
 ```
 
-`login` posts once to Screener's own login form and keeps **only the returned cookie**, in
-`~/.config/screener-mcp/session.json` at mode `0600`. Your password is never written to
-disk, never logged, and never placed in an MCP config file. All four data tools work
-anonymously; sign-in only adds account-gated data.
+Either way, only the returned cookie is kept, in `~/.config/screener-mcp/session.json` at
+mode `0600` — never a password, never anything in an MCP config file. All the read-only
+tools work anonymously; sign-in adds `run_screen` and account-gated data.
 
 The session outlives the server process, so you log in once, not per MCP session. When the
 cookie expires, tools return an instruction to re-run `login` instead of failing obscurely —
 and agents can call `screener_auth_status` to check deliberately.
 
-If Screener ever puts a captcha in front of login, fall back to copying the cookie by hand:
-sign in with a browser, take the `sessionid` value from DevTools → Application → Cookies,
-and pass it as an env var (this takes precedence over the stored file):
+### `login` (email + password)
+
+Posts once to Screener's own `/login/` form and keeps the `sessionid` it returns. Your
+password is used for that single request and is never stored or logged.
+
+### `login --browser`
+
+Screener also offers `/login/google/` and `/login/apple/`. **If you signed up with Google
+or Apple there is no password to post, so plain `login` cannot work for you** — use
+`--browser`.
+
+It opens a Chromium window at Screener's login page, you sign in however you normally do,
+and it watches the cookie jar until `sessionid` appears, then verifies it, saves it, and
+closes the browser. Nothing you type passes through the CLI. It reads `sessionid` even
+though the cookie is `HttpOnly` (a browser console could not), and captures `csrftoken`
+alongside it for future gated POSTs.
+
+The Chromium profile is kept at `~/.config/screener-mcp/browser-profile` (mode `0700`) so a
+Google/Apple sign-in survives between runs — refreshing an expired cookie later is one
+click, not a full re-auth. `logout` deletes the profile as well as the session.
+
+Two requirements, both only for `--browser`:
+
+- **Playwright**, which is *not* a dependency of this package (it pulls a
+  several-hundred-megabyte browser, and most installs only ever run the server):
+  `npm install playwright && npx playwright install chromium`. It's looked up in your
+  working directory and the global npm root; `SCREENER_PLAYWRIGHT_PATH` points at it
+  anywhere else. To reuse a Chrome you already have, install `playwright-core` instead and
+  set `SCREENER_BROWSER_EXECUTABLE`.
+- **Node 20+**, because Playwright requires it. The server itself still runs on Node 18.
+
+It also needs a display, so it won't work over a plain SSH session or on a headless cloud
+desktop — run it on the machine with your browser, or use the cookie-by-hand route below.
+
+### Cookie by hand
+
+If neither path fits (headless host, or Screener puts a captcha in front of login), sign in
+with a browser, take the `sessionid` value from DevTools → Application → Cookies, and pass
+it as an env var (this takes precedence over the stored file):
 
 ```json
 {
@@ -109,8 +145,11 @@ and pass it as an env var (this takes precedence over the stored file):
 | Env var | Purpose |
 |---|---|
 | `SCREENER_SESSION_ID` | Use this cookie instead of the stored session |
-| `SCREENER_MCP_CONFIG_DIR` | Override where the session is stored |
+| `SCREENER_MCP_CONFIG_DIR` | Override where the session and browser profile are stored |
 | `SCREENER_USERNAME` / `SCREENER_PASSWORD` | Non-interactive `login`, for CI/headless |
+| `SCREENER_BROWSER_EXECUTABLE` | Path to an existing Chrome for `--browser` |
+| `SCREENER_PLAYWRIGHT_PATH` | Path to a `playwright` module dir, if it isn't in cwd or the global npm root |
+| `SCREENER_BROWSER_HEADLESS` | Run `--browser` headless. Only refreshes an already signed-in profile — it cannot complete a first-time sign-in |
 
 Use your own account only, and note that automated access to account-gated pages is subject
 to [Screener's terms](https://www.screener.in/terms/).

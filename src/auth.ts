@@ -22,6 +22,8 @@ export function sessionPath(): string {
 
 export interface StoredSession {
   sessionId: string;
+  /** Only needed to POST to Django-backed forms; reads work without it. */
+  csrfToken?: string;
   /** Screener account the cookie belongs to, for `screener_auth_status`. Not a secret. */
   username?: string;
   savedAt: string;
@@ -64,7 +66,10 @@ export function clearSession(): boolean {
 /** Cookie header for an authenticated request, or undefined when anonymous. */
 export function cookieHeader(): string | undefined {
   const s = loadSession();
-  return s ? `sessionid=${s.sessionId}` : undefined;
+  if (!s) return undefined;
+  const parts = [`sessionid=${s.sessionId}`];
+  if (s.csrfToken) parts.push(`csrftoken=${s.csrfToken}`);
+  return parts.join("; ");
 }
 
 function parseSetCookie(res: Response, name: string): string | null {

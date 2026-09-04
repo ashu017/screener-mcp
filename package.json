@@ -1,12 +1,16 @@
 {
   "name": "screener-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server exposing Screener.in Indian-stock fundamentals, financials, peers, and price/EPS trends.",
   "type": "module",
   "bin": {
     "screener-mcp": "dist/index.js"
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
@@ -15,7 +19,15 @@
     "prepare": "tsc",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["mcp", "screener", "india", "nse", "bse", "stocks", "fundamentals"],
+  "keywords": [
+    "mcp",
+    "screener",
+    "india",
+    "nse",
+    "bse",
+    "stocks",
+    "fundamentals"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
