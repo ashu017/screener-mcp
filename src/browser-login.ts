@@ -11,8 +11,9 @@
  * however they normally do, and watch the cookie jar until `sessionid` appears.
  * We never see the password, and no credential passes through this process.
  */
-import { chmodSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, readlinkSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { sessionPath } from "./auth.js";
@@ -20,6 +21,10 @@ import { sessionPath } from "./auth.js";
 const BASE = "https://www.screener.in";
 
 export class BrowserLoginError extends Error {}
+
+/** The profile directory is already in use by a running browser. Its own type
+ * because the remedy is specific and the raw failure is unreadable. */
+export class ProfileLockedError extends BrowserLoginError {}
 
 /**
  * Chromium profile directory. Persisting it means a Google/Apple sign-in survives
@@ -39,6 +44,69 @@ export function clearBrowserProfile(): boolean {
   }
 }
 
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM means the process is there but belongs to someone else — still alive.
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * The pid of the browser currently holding `profile`, or null if nobody is.
+ *
+ * Chrome allows one process per profile directory and records the holder in a
+ * `SingletonLock` symlink whose *target* is `<hostname>-<pid>`. The link is
+ * dangling by design — the target never exists as a file — so `existsSync` reports
+ * false and only `readlink` can see it.
+ *
+ * The lock is not cleaned up on exit, so its mere presence proves nothing; we have
+ * to check the pid is still running. A recycled pid could in principle fool this,
+ * which is a race Chrome itself also has, and the cost is a misleading message
+ * rather than a broken profile.
+ */
+export function profileLockHolder(profile: string): number | null {
+  let target: string;
+  try {
+    target = readlinkSync(join(profile, "SingletonLock"));
+  } catch {
+    return null; // No lock, or no profile yet.
+  }
+  // Hostnames contain hyphens, so anchor on the numeric pid at the end.
+  const m = /^(.*)-(\d+)$/.exec(target);
+  if (!m) return null;
+  // A lock written by a different machine (shared or NFS home directory) tells us
+  // nothing about this one, and its pid would refer to some unrelated local process.
+  if (m[1] !== hostname()) return null;
+  const pid = Number(m[2]);
+  return pidAlive(pid) ? pid : null;
+}
+
+/** Shared wording, so the pre-flight check and the post-mortem read identically. */
+export function profileLockedError(profile: string, pid?: number): ProfileLockedError {
+  return new ProfileLockedError(
+    "A browser is already using the sign-in profile, so another one cannot start:\n" +
+      `  ${profile}\n` +
+      (pid ? `It is being used by process ${pid}.\n` : "") +
+      "\nChrome only lets one program use a profile folder at a time. Usually this means a\n" +
+      "sign-in is already running in another window or terminal.\n\n" +
+      "  1. If you have another `screener-mcp login` running, finish signing in there.\n" +
+      "  2. If a leftover browser window is open, close it and try again.\n" +
+      "  3. If neither is true, the profile can be thrown away safely — it only holds a\n" +
+      "     browser sign-in, not your Screener session:\n" +
+      "       npx screener-mcp logout",
+  );
+}
+
+/** Refuse early rather than letting the browser die with a message about
+ * "ProcessSingleton", which means nothing to anyone who has not read Chrome's source. */
+export function assertProfileUnlocked(profile: string): void {
+  const pid = profileLockHolder(profile);
+  if (pid !== null) throw profileLockedError(profile, pid);
+}
+
 /**
  * Playwright is deliberately not a dependency of this package: it pulls a
  * several-hundred-megabyte browser, and almost everyone who installs
@@ -52,8 +120,11 @@ async function loadChromium(): Promise<any> {
   if (Number.isFinite(major) && major < 20) {
     throw new BrowserLoginError(
       `Browser login needs Node 20 or newer (you are on ${process.versions.node}), because Playwright does.\n` +
-        "The MCP server itself still runs fine on Node 18 — this limit only applies to --browser.\n" +
-        "Either upgrade Node, or sign in with `npx screener-mcp login` (email + password).",
+        "The MCP server itself still runs fine on Node 18 — this limit only applies to --browser.\n\n" +
+        "Either upgrade Node, or:\n" +
+        "  * `npx screener-mcp login --chrome` — uses the Chrome you already have, no download\n" +
+        "    (needs Node 22 or newer), or\n" +
+        "  * `npx screener-mcp login` — asks for your email and password.",
     );
   }
 
@@ -74,12 +145,13 @@ async function loadChromium(): Promise<any> {
   }
   throw new BrowserLoginError(
     `Browser login needs Playwright, which could not be found.\n\n` +
-      "Install it next to wherever you run this from:\n" +
+      "The easiest fix is to skip Playwright altogether and use the Chrome you already\n" +
+      "have — same sign-in, nothing to download:\n" +
+      "  npx screener-mcp login --chrome\n\n" +
+      "Or install Playwright next to wherever you run this from:\n" +
       "  npm install playwright && npx playwright install chromium\n\n" +
       "Or install it anywhere and point at it:\n" +
       "  SCREENER_PLAYWRIGHT_PATH=/path/to/node_modules/playwright npx screener-mcp login --browser\n\n" +
-      "Or, to reuse a Chrome you already have rather than downloading one, install\n" +
-      "`playwright-core` and set SCREENER_BROWSER_EXECUTABLE=/path/to/chrome.\n\n" +
       `Tried: ${tried.join(", ")}`,
   );
 }
@@ -122,7 +194,7 @@ function globalNodeModules(): string | null {
  * silently mint a fresh `sessionid` with no interaction. You cannot complete a
  * first-time sign-in this way, because there is no window to type into.
  */
-function headless(): boolean {
+export function headlessRequested(): boolean {
   const v = process.env.SCREENER_BROWSER_HEADLESS?.trim().toLowerCase();
   return v === "1" || v === "true";
 }
@@ -130,15 +202,18 @@ function headless(): boolean {
 /**
  * A headed browser needs somewhere to draw. Failing here with an explanation beats
  * letting Chromium die with "Missing X server or $DISPLAY" several seconds later.
+ *
+ * `flag` is the option the user actually typed, so the advice names the command they
+ * ran rather than whichever path happens to be calling.
  */
-function assertDisplay(): void {
-  if (headless()) return;
+export function assertDisplay(flag: "--browser" | "--chrome"): void {
+  if (headlessRequested()) return;
   if (process.platform !== "linux") return;
   if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY) return;
   throw new BrowserLoginError(
     "No DISPLAY or WAYLAND_DISPLAY set — this is a headless Linux host, so no browser\n" +
       "window can be shown. Two ways round it:\n\n" +
-      "  1. Run `npx screener-mcp login --browser` on a machine with a desktop.\n" +
+      `  1. Run \`npx screener-mcp login ${flag}\` on a machine with a desktop.\n` +
       "  2. Sign in with the browser you already use, copy the `sessionid` cookie from\n" +
       "     DevTools -> Application -> Cookies -> screener.in, and pass it through:\n" +
       "       SCREENER_SESSION_ID=<cookie>\n" +
@@ -153,7 +228,9 @@ export interface BrowserLoginResult {
   csrfToken?: string;
 }
 
-function pickCookies(cookies: any[]): BrowserLoginResult | null {
+/** Shared by both login paths: Playwright cookies and CDP cookies agree on the
+ * three fields we care about, so one reader serves both. */
+export function pickCookies(cookies: any[]): BrowserLoginResult | null {
   const mine = cookies.filter((c) => String(c?.domain ?? "").endsWith("screener.in"));
   const sessionId = mine.find((c) => c.name === "sessionid")?.value;
   if (!sessionId) return null;
@@ -168,24 +245,29 @@ export interface BrowserLoginOptions {
 }
 
 export async function browserLogin(opts: BrowserLoginOptions = {}): Promise<BrowserLoginResult> {
-  assertDisplay();
+  assertDisplay("--browser");
   const chromium = await loadChromium();
 
   const profile = browserProfilePath();
+  assertProfileUnlocked(profile);
   mkdirSync(profile, { recursive: true, mode: 0o700 });
   chmodSync(profile, 0o700);
 
   let context: any;
   try {
     context = await chromium.launchPersistentContext(profile, {
-      headless: headless(),
+      headless: headlessRequested(),
       viewport: null,
       args: ["--window-size=1100,940"],
       executablePath: process.env.SCREENER_BROWSER_EXECUTABLE || undefined,
     });
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    // The pre-flight check above catches the common case, but a second browser can
+    // still take the lock in the moment between checking and launching.
+    if (/ProcessSingleton|SingletonLock|profile.*in use/i.test(message)) throw profileLockedError(profile);
     throw new BrowserLoginError(
-      `Could not launch Chromium: ${e instanceof Error ? e.message : String(e)}\n` +
+      `Could not launch Chromium: ${message}\n` +
         "If the browser itself is missing, run: npx playwright install chromium",
     );
   }

@@ -145,6 +145,101 @@ export async function login(username: string, password: string): Promise<string>
   throw new LoginError(`Unexpected response from Screener login: HTTP ${res.status}`);
 }
 
+/**
+ * What state is our Screener session in?
+ *
+ * Three outcomes, not two, because the fix differs in each. "Never signed in" needs
+ * a choice of sign-in method. "Expired" needs the same command again, and is worth
+ * distinguishing because the user *has* done this before and would otherwise be told
+ * something they know is untrue. "Active" needs nothing.
+ *
+ * `instruction` is written to be relayed verbatim to a non-technical user by an
+ * assistant that cannot see this file.
+ */
+export type SessionState =
+  | { state: "anonymous"; sessionFile: string; instruction: string }
+  | { state: "active"; account: string | null; savedAt: string; instruction: string }
+  | {
+      state: "expired";
+      account: string | null;
+      savedAt: string;
+      sessionFile: string;
+      /** True when the dead cookie came from SCREENER_SESSION_ID rather than the file. */
+      fromEnv: boolean;
+      instruction: string;
+    }
+  /**
+   * A fourth outcome, and deliberately not folded into any of the three: deciding
+   * between "valid" and "expired" needs a round trip to Screener, and when that round
+   * trip cannot happen we do not know which it is. Reporting "expired" here would
+   * send the user off to sign in again over what is really a dropped Wi-Fi
+   * connection, and reporting "active" would be a guess in the user's favour.
+   */
+  | { state: "unknown"; account: string | null; savedAt: string; reason: string; instruction: string };
+
+const SIGN_IN_CHOICES =
+  "Ask the user to run one of these in a terminal, then try again:\n" +
+  "  * `npx screener-mcp login --chrome`  — opens the Chrome they already have (easiest)\n" +
+  "  * `npx screener-mcp login`           — asks for their Screener email and password\n" +
+  "If they signed up to Screener with Google or Apple, they must use --chrome, because\n" +
+  "there is no password to type.";
+
+export async function sessionState(): Promise<SessionState> {
+  const s = loadSession();
+  if (!s) {
+    return {
+      state: "anonymous",
+      sessionFile: sessionPath(),
+      instruction:
+        "Not signed in to Screener, so only public data is available.\n" + SIGN_IN_CHOICES,
+    };
+  }
+
+  let who: { valid: boolean; username?: string };
+  try {
+    who = await whoami(s.sessionId);
+  } catch (e) {
+    return {
+      state: "unknown",
+      account: s.username ?? null,
+      savedAt: s.savedAt,
+      reason: e instanceof Error ? e.message : String(e),
+      instruction:
+        "Could not reach screener.in to check whether the saved sign-in still works, so\n" +
+        "this may or may not be a sign-in problem. Ask the user to check their internet\n" +
+        "connection and try again. There is no need to sign in again yet.",
+    };
+  }
+  if (who.valid) {
+    return {
+      state: "active",
+      account: who.username ?? s.username ?? null,
+      savedAt: s.savedAt,
+      instruction: "Signed in to Screener. No action needed.",
+    };
+  }
+
+  // The cookie is real but Screener no longer honours it — the usual cause is simply
+  // that it aged out. Say "expired" rather than "not signed in", which would read as
+  // if they had never done it.
+  const fromEnv = Boolean(process.env.SCREENER_SESSION_ID?.trim());
+  return {
+    state: "expired",
+    account: s.username ?? null,
+    savedAt: s.savedAt,
+    sessionFile: sessionPath(),
+    fromEnv,
+    instruction: fromEnv
+      ? "The Screener session in the SCREENER_SESSION_ID environment variable has expired.\n" +
+        "Because that variable overrides the saved sign-in, running `login` again will NOT\n" +
+        "fix it. Ask the user to either remove SCREENER_SESSION_ID and run\n" +
+        "`npx screener-mcp login --chrome`, or replace it with a fresh sessionid cookie."
+      : "The saved Screener sign-in has expired. This is normal — the cookie does not last\n" +
+        "forever. Ask the user to run `npx screener-mcp login --chrome` again; if they signed\n" +
+        "in that way before, the browser usually remembers them and it takes one click.",
+  };
+}
+
 /** Verify a cookie is still live and get the account it belongs to. Screener
  * bounces anonymous requests for /dash/ back to the login page. */
 export async function whoami(sessionId: string): Promise<{ valid: boolean; username?: string }> {

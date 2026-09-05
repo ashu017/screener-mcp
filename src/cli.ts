@@ -1,6 +1,14 @@
 import { createInterface } from "node:readline";
-import { clearSession, loadSession, login, LoginError, saveSession, sessionPath, whoami } from "./auth.js";
-import { browserLogin, BrowserLoginError, browserProfilePath, clearBrowserProfile } from "./browser-login.js";
+import { clearSession, login, LoginError, saveSession, sessionPath, sessionState, whoami } from "./auth.js";
+import {
+  browserLogin,
+  BrowserLoginError,
+  browserProfilePath,
+  clearBrowserProfile,
+  type BrowserLoginOptions,
+  type BrowserLoginResult,
+} from "./browser-login.js";
+import { cdpLogin } from "./cdp-login.js";
 
 function ask(prompt: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -72,13 +80,27 @@ async function persistLogin(sessionId: string, csrfToken: string | undefined, fa
 }
 
 /**
- * Open a browser and wait for the user to sign in. This is the only path that works
- * for Google/Apple accounts, which have no password to post.
+ * Open a browser and wait for the user to sign in. Either path works for
+ * Google/Apple accounts, which have no password to post; they differ only in where
+ * the browser comes from.
  */
-async function cmdLoginBrowser(timeoutMs: number): Promise<number> {
+async function cmdLoginBrowser(
+  how: "--browser" | "--chrome",
+  timeoutMs: number,
+): Promise<number> {
+  const run: (o: BrowserLoginOptions) => Promise<BrowserLoginResult> =
+    how === "--chrome" ? cdpLogin : browserLogin;
+
   process.stderr.write(
-    "Opening Screener in a browser window. Sign in however you normally do — Google,\n" +
-      "Apple, or email and password. Nothing you type passes through this process.\n\n",
+    (how === "--chrome"
+      ? "Opening Screener in a new window of the Chrome you already have. Sign in however\n" +
+        "you normally do — Google, Apple, or email and password. Nothing you type passes\n" +
+        "through this process.\n\n" +
+        "Chrome will open with a profile of its own, so your usual tabs, bookmarks and\n" +
+        "history are untouched — and it will ask you to sign in even if you are already\n" +
+        "signed in elsewhere. It only asks once; the profile is remembered after that.\n\n"
+      : "Opening Screener in a browser window. Sign in however you normally do — Google,\n" +
+        "Apple, or email and password. Nothing you type passes through this process.\n\n"),
   );
   const spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
   let tick = 0;
@@ -89,7 +111,7 @@ async function cmdLoginBrowser(timeoutMs: number): Promise<number> {
     : undefined;
 
   try {
-    const { sessionId, csrfToken } = await browserLogin({ timeoutMs, onWait: progress });
+    const { sessionId, csrfToken } = await run({ timeoutMs, onWait: progress });
     if (progress) process.stderr.write("\r  ✔ session cookie captured                    \n");
     return persistLogin(sessionId, csrfToken, "");
   } catch (e) {
@@ -121,25 +143,37 @@ async function cmdLogin(): Promise<number> {
     process.stderr.write(`\nLogin failed: ${e instanceof LoginError ? e.message : String(e)}\n`);
     process.stderr.write(
       "\nIf you signed up with Google or Apple there is no password to use here —\n" +
-        "run `npx screener-mcp login --browser` instead.\n",
+        "run `npx screener-mcp login --chrome` instead.\n",
     );
     return 1;
   }
 }
 
+/** The three states are worth distinguishing here for the same reason they are worth
+ * distinguishing in the MCP tool: "expired" and "never signed in" need different words. */
 async function cmdStatus(): Promise<number> {
-  const s = loadSession();
-  if (!s) {
-    process.stderr.write(`Not signed in. No session at ${sessionPath()}.\nRun: npx screener-mcp login\n`);
-    return 1;
+  const st = await sessionState();
+  switch (st.state) {
+    case "anonymous":
+      process.stderr.write(`Not signed in. No session at ${st.sessionFile}.\n\n${st.instruction}\n`);
+      return 1;
+    case "expired":
+      process.stderr.write(
+        `Signed in previously${st.account ? ` as ${st.account}` : ""} (saved ${st.savedAt}), but that\n` +
+          `session has expired — Screener no longer accepts it.\n\n${st.instruction}\n`,
+      );
+      return 1;
+    case "unknown":
+      process.stderr.write(
+        `Could not check the saved sign-in: ${st.reason}\n\n${st.instruction}\n`,
+      );
+      return 1;
+    case "active":
+      process.stderr.write(
+        `Signed in as ${st.account ?? "(unknown)"}. Session saved ${st.savedAt}.\n`,
+      );
+      return 0;
   }
-  const who = await whoami(s.sessionId);
-  if (!who.valid) {
-    process.stderr.write(`Session found (saved ${s.savedAt}) but Screener rejected it — it has expired.\nRun: npx screener-mcp login\n`);
-    return 1;
-  }
-  process.stderr.write(`Signed in as ${who.username || s.username || "(unknown)"}. Session saved ${s.savedAt}.\n`);
-  return 0;
 }
 
 function cmdLogout(): number {
@@ -156,24 +190,33 @@ const USAGE = `screener-mcp — MCP server for Screener.in
 Usage:
   screener-mcp                    Run the MCP server on stdio (default; for MCP clients)
   screener-mcp login              Sign in with email + password, store a session cookie
-  screener-mcp login --browser    Sign in in a real browser window (Google/Apple too)
+  screener-mcp login --chrome     Sign in in the Chrome you already have (Google/Apple too)
+  screener-mcp login --browser    Sign in in a Playwright browser (Google/Apple too)
   screener-mcp status             Show whether the stored session is still valid
   screener-mcp logout             Delete the stored session and browser profile
 
 Options:
-  --browser               Open a browser and wait for you to sign in, instead of
-                          prompting for a password. Required for Google/Apple
-                          accounts, which have no password to post. Needs
-                          Playwright and Node 20+; needs a display.
-  --timeout <seconds>     How long --browser waits for sign-in (default 300)
+  --chrome                Open the Chrome (or Chromium/Edge/Brave) already installed
+                          on this computer and wait for you to sign in. Nothing to
+                          download. Works for Google/Apple accounts, which have no
+                          password to post. Needs Node 22+ and a display.
+  --browser               The same thing through Playwright, which downloads its own
+                          browser. Needs Playwright and Node 20+, and a display.
+                          Use this if --chrome cannot find a browser.
+  --timeout <seconds>     How long --chrome/--browser waits for sign-in (default 300)
+
+Both browser options open a browser profile of their own, kept separate from your
+everyday one, so you sign in there once. Neither ever sees your password.
 
 Environment:
-  SCREENER_SESSION_ID          Use this sessionid cookie instead of the stored one
+  SCREENER_SESSION_ID          Use this sessionid cookie instead of the stored one.
+                               Note it overrides a saved sign-in, so \`login\` cannot
+                               replace an expired value here.
   SCREENER_MCP_CONFIG_DIR      Override where the session and profile are stored
-  SCREENER_BROWSER_EXECUTABLE  Path to an existing Chrome for --browser
+  SCREENER_BROWSER_EXECUTABLE  Path to the browser to use for --chrome or --browser
   SCREENER_PLAYWRIGHT_PATH     Path to a playwright module dir, if not in cwd
-  SCREENER_BROWSER_HEADLESS    Run --browser headless; only refreshes a profile
-                               that is already signed in
+  SCREENER_BROWSER_HEADLESS    Run --chrome/--browser headless; only refreshes a
+                               profile that is already signed in
 `;
 
 /** Returns an exit code when it handled a subcommand, or null to run the server. */
@@ -182,19 +225,32 @@ export async function runCli(argv: string[]): Promise<number | null> {
   const flags = argv.slice(1);
   switch (cmd) {
     case "login": {
-      const unknown = flags.filter((a, i) => a.startsWith("-") && a !== "--browser" && a !== "--timeout" && flags[i - 1] !== "--timeout");
+      const known = new Set(["--browser", "--chrome", "--timeout"]);
+      const unknown = flags.filter((a, i) => a.startsWith("-") && !known.has(a) && flags[i - 1] !== "--timeout");
       if (unknown.length) {
         process.stderr.write(`Unknown option(s) for login: ${unknown.join(", ")}\n\n${USAGE}`);
         return 1;
       }
-      if (!flags.includes("--browser")) return cmdLogin();
+      const wantsChrome = flags.includes("--chrome");
+      const wantsPlaywright = flags.includes("--browser");
+      if (wantsChrome && wantsPlaywright) {
+        process.stderr.write(
+          "Pick one of --chrome or --browser, not both.\n" +
+            "  --chrome  uses the browser already on this computer (nothing to download)\n" +
+            "  --browser uses Playwright's own browser\n",
+        );
+        return 1;
+      }
+      // Validated even when no browser flag was given, so a stray --timeout is never
+      // silently ignored.
       const raw = flags[flags.indexOf("--timeout") + 1];
       const seconds = flags.includes("--timeout") ? Number(raw) : 300;
       if (!Number.isFinite(seconds) || seconds <= 0) {
         process.stderr.write(`--timeout needs a positive number of seconds, got '${raw ?? ""}'.\n`);
         return 1;
       }
-      return cmdLoginBrowser(seconds * 1000);
+      if (!wantsChrome && !wantsPlaywright) return cmdLogin();
+      return cmdLoginBrowser(wantsChrome ? "--chrome" : "--browser", seconds * 1000);
     }
     case "status":
       return cmdStatus();
