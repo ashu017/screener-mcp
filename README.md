@@ -18,7 +18,7 @@ the chart tool uses Screener's JSON chart API.
 | `get_chart` | `symbol`, `metric?`, `days?` | Time-series from the chart API. `metric` e.g. `Price-DMA50-Volume`, `Price`, `Quarter Sales`, `EPS` |
 | `get_ratios` | `symbol` | The same fundamentals as **typed numbers** (`pe`, `pb`, `roe`, `roce`, `debtEquity`, `salesGrowth3yPct`, `promoterHoldingPct`, …) rather than display strings |
 | `get_quarterly_results` | `symbol` | Per-quarter Sales / Net Profit / EPS / OPM keyed by ISO quarter-end date |
-| `screen_stocks` | `query`, `limit?`, `sort?`, `order?`, `refresh?` | Screens **~5,400 companies with no sign-in**. Nine metrics; see [Screening](#screening) |
+| `screen_stocks` | `query`, `limit?`, `sort?`, `order?`, `minMarketCapCr?`, `refresh?` | Screens **~5,400 companies with no sign-in**. Nine metrics; see [Screening](#screening) |
 | `get_public_screen` | `screen`, `maxPages?`, `sort?`, `order?` | Reads a **saved** screen by id or URL, no sign-in. Also returns the screen's own DSL |
 | `build_screen_link` | `query` | A link the *user* clicks to run any query in their own signed-in browser, plus the words to send with it |
 | `list_public_screens` | `page?`, `maxPages?` | Screener's directory of public screens, for finding one that already exists |
@@ -40,7 +40,7 @@ to a screen. **Start with `screen_stocks`** — it needs no account at all.
 
 ### `screen_stocks` — no account, whole market
 
-Screener publishes the same table a screen renders on its 188 public industry pages under
+Screener publishes the same table a screen renders on its public industry pages under
 `/market/`. `screen_stocks` sweeps them into a local cache — **5,438 companies** as of
 2026-09-04, from Bharti Airtel down to sub-crore microcaps — and evaluates your query
 against all of it. That's the whole listed universe, not 50 rows a page.
@@ -64,9 +64,47 @@ where *nothing* applies throws rather than handing back 5,438 rows dressed up as
 
 Only `AND` is supported; `OR` and parentheses land in `unappliedClauses` too.
 
-**The first call builds the cache and takes several minutes** (188 leaves, ~336 requests,
-~450 s at the default deliberate pacing). It's cached for 12 h after that, so later calls
-return instantly. Progress goes to stderr, which most MCP clients surface as server logs.
+#### Cold-call cost, and how to cut it
+
+The first call builds the cache by sweeping Screener at a deliberately slow ~0.77 req/s, so
+its cost is essentially the number of pages fetched. **A market-cap floor in the query cuts
+that by 7×**, because two properties of these pages compound:
+
+- `/market/`'s four-level taxonomy **aggregates**. Only the 188 leaves are linked, but the
+  1-, 2- and 3-level prefixes are live URLs serving the union of their children —
+  `/market/IN02/` reports 1,402 companies, matching what its 12 leaves held. So the same
+  universe is reachable from **12 sector pages instead of 188 leaves**.
+- Every page is strictly **market-cap descending** (verified across all 188 leaves and 5,438
+  rows, zero inversions). So a query with a market-cap floor can stop paging a sector the
+  moment its rows drop below the floor.
+
+Coarse buckets are what make the floor pay: the fixed one-page-per-bucket cost is 12 requests
+rather than 188, leaving early termination something to save. Measured:
+
+| Sweep | Pages | Time |
+|---|---|---|
+| 188 leaves, no floor (the old default) | 334 | 449 s |
+| 12 sectors, no floor | 223 | ~300 s |
+| 12 sectors, `Market Capitalization > 1000` | 70 | ~94 s |
+| 12 sectors, `Market Capitalization > 10000` | **32** | **36 s** |
+
+That last row is measured end-to-end and returns the *identical* 152 matches the 449 s sweep
+did. So put a market-cap clause in the query when you can, or set `minMarketCapCr` when the
+DSL has no such clause but the user doesn't care about microcaps — it's reported back as an
+applied clause, since it narrows the answer.
+
+The pacing constants are untouched; the speed-up is entirely fewer requests. Results are
+cached 12 h. Progress goes to stderr, which most MCP clients surface as server logs.
+
+Two things a floored sweep gives up, both reported rather than hidden. `universeSize` counts
+only companies at or above the floor, so it is **not** the size of the market — the result
+carries `universeMinMarketCapCr` and says so in `note`. And a cache swept to floor F is only
+reused for queries whose own floor is ≥ F; widen the query below F and it re-sweeps rather
+than answer from a universe that is missing exactly the companies you just asked for.
+
+Sector-level sweeping also makes each row's `industryName` a sector ("Consumer Discretionary")
+rather than a specific industry ("Commodity Chemicals"). `industryLevel` on every row says
+which you got, and `note` mentions it.
 
 ### `build_screen_link` + `get_public_screen` — any query, still no credential
 
@@ -283,8 +321,9 @@ so they are deterministic and don't hit the network.
 - **Screener will IP-block you at the TCP level**, with no 429 first — connections simply
   stop being accepted. Measured: 4 concurrent requests at 200 ms spacing got a host blocked
   for ~57 minutes after roughly 30 requests. `screen_stocks` therefore defaults to 2
-  concurrent with 2000 ms spacing, which swept all 188 industry pages untouched, and caches
-  the result for 12 h. Don't raise those without re-measuring.
+  concurrent with 2000 ms spacing, which swept every industry page untouched, and caches the
+  result for 12 h. Don't raise those without re-measuring — `screen_stocks` got 12× faster by
+  fetching fewer pages, not by pacing them harder, which is the only safe lever here.
 - `screener.in/robots.txt` disallows the `?page=`, `?sort=`, `?limit=` and `?q=` query
   parameters. Paginating a screen or an industry page necessarily requests `?page=N`, so
   `screen_stocks`, `get_public_screen` and `run_screen` do send disallowed query strings.

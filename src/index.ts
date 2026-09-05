@@ -146,7 +146,10 @@ server.tool(
     "When that happens, call get_ratios on each shortlisted symbol to check the remaining conditions, and " +
     "relay `note` to the user rather than presenting the rows as an exact match. Only AND is supported; " +
     "OR and parentheses land in unappliedClauses. `slug` on each row works as `symbol` for the other tools. " +
-    "The first call of the day builds a cache and takes several minutes; later calls are instant for 12h.",
+    "SPEED: the first call builds a 12h cache by sweeping Screener, and a market-cap floor in the query " +
+    "makes that dramatically cheaper — 'Market Capitalization > 10000' costs ~40s where an unbounded query " +
+    "costs ~5min, because the sweep can stop once companies get too small. If the user doesn't care about " +
+    "microcaps, either put a market-cap clause in `query` or set `minMarketCapCr`.",
   {
     query: z
       .string()
@@ -154,20 +157,32 @@ server.tool(
     limit: z.number().int().min(1).max(500).default(25).describe("Rows to return; totalResults still counts every match"),
     sort: z.string().optional().describe("Metric to sort by, e.g. 'Market Capitalization'. Defaults to market cap"),
     order: z.enum(["asc", "desc"]).optional().describe("Sort direction; defaults to desc"),
+    minMarketCapCr: z
+      .number()
+      .min(0)
+      .default(0)
+      .describe(
+        "Ignore companies below this market cap (Rs. Cr). Makes a cold call much faster, and is reported " +
+          "as an applied clause since it narrows the answer. Leave 0 when the whole market matters",
+      ),
     refresh: z.boolean().default(false).describe("Ignore the cache and re-sweep. Slow — only when data must be fresh"),
   },
-  async ({ query, limit, sort, order, refresh }) => {
+  async ({ query, limit, sort, order, minMarketCapCr, refresh }) => {
     try {
-      // The first sweep is minutes long, so report progress on stderr where MCP
+      // A cold sweep runs for minutes, so report progress on stderr where MCP
       // clients surface server logs; otherwise the call just looks hung.
       return json(
         await screenAnonymously(query, {
           limit,
           sort,
           order,
+          minMarketCapCr,
           force: refresh,
           onProgress: (p) =>
-            console.error(`[screen_stocks] ${p.industriesDone}/${p.industriesTotal} industries, ${p.rows} companies`),
+            console.error(
+              `[screen_stocks] ${p.industriesDone}/${p.industriesTotal} sectors, ` +
+                `${p.pagesFetched} pages, ${p.rows} companies (${p.lastIndustry})`,
+            ),
         }),
       );
     } catch (e) {

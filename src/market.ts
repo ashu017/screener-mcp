@@ -6,7 +6,7 @@
  * the same table anonymously through its industry browser: /market/ links 188
  * leaf industry pages, and each leaf renders the identical column set that a
  * screen renders (CMP, P/E, Mar Cap, Div Yld, NP Qtr, Qtr Profit Var, Sales Qtr,
- * Qtr Sales Var, ROCE). Sweeping every leaf therefore yields the whole universe —
+ * Qtr Sales Var, ROCE). Sweeping those therefore yields the whole universe —
  * 5,438 companies as of 2026-09-04, from Bharti Airtel (11.5 lakh Cr) down to
  * microcaps worth well under a crore (smallest seen: 0.07 Cr) — no login at all.
  *
@@ -15,6 +15,26 @@
  * not on these pages, so `screenAnonymously` reports such clauses as *unapplied*
  * rather than dropping them. A screen that silently ignored a filter would be
  * confidently wrong, which is worse than one that admits what it could not do.
+ *
+ * Two measured properties of those pages make the sweep far cheaper than one page
+ * per leaf, and the `level`/`minMarketCapCr` options exist to exploit them:
+ *
+ *   1. Intermediate levels AGGREGATE. /market/ only links 4-level leaves, but the
+ *      1-, 2- and 3-level prefixes are all live and serve the union of their
+ *      children — /market/IN02/ reports 1,402 results, matching the 1,400 rows the
+ *      12 IN02 leaves held a day earlier. So the same universe is reachable from
+ *      12 sector URLs instead of 188 leaf URLs. Since every bucket costs at least
+ *      one request, 12 buckets is 223 pages where 188 buckets is 334.
+ *   2. Every page is strictly market-cap DESCENDING. Verified across all 188
+ *      leaves, 5,438 rows, zero inversions, and again on the aggregate pages. A
+ *      query with a market-cap floor can therefore stop paging a bucket the moment
+ *      rows fall below the floor — 31 pages instead of 223 for a 10,000 Cr floor.
+ *
+ * Coarser buckets are what make (2) pay: the fixed one-page-per-bucket cost is 12
+ * requests rather than 188, so early termination has something left to save. The
+ * cost is that `industryName` is then a sector ("Consumer Discretionary") rather
+ * than a leaf ("Commodity Chemicals"); `industryLevel` says which you got, and
+ * `level: 4` restores the fine-grained labels at the old price.
  *
  * NOTE FOR MAINTAINERS: screener.in/robots.txt disallows `/*?page=`, `/*?sort=`
  * and `/*?limit=`. Paginating a leaf necessarily requests `?page=N`. Page 1 is
@@ -36,10 +56,19 @@ const BASE = "https://www.screener.in";
 const ROWS_PER_PAGE = 25;
 
 /** Bumped whenever the cached row shape changes, so an old file is ignored
- * rather than deserialized into the wrong type. */
-const CACHE_VERSION = 1;
+ * rather than deserialized into the wrong type. v1 files are migrated rather
+ * than discarded — see `readCache` — because a v1 sweep is by construction a
+ * complete level-4 one, which is strictly better than anything v2 produces. */
+const CACHE_VERSION = 2;
 
 const DEFAULT_TTL_HOURS = 12;
+
+/** How many of the four taxonomy levels to address when sweeping. 1 = the 12
+ * sector pages, 4 = the 188 leaves /market/ actually links. Level 1 by default:
+ * same companies, a third fewer requests, and it is what makes a market-cap
+ * floor worth honouring. See the module comment. */
+export type SweepLevel = 1 | 2 | 3 | 4;
+const DEFAULT_SWEEP_LEVEL: SweepLevel = 1;
 
 // ---------------------------------------------------------------------------
 // Row shape
@@ -71,10 +100,16 @@ export interface MarketRow extends MarketMetrics {
    * that only trade on BSE — both resolve on /company/<slug>/. */
   slug: string;
   name: string;
-  /** The leaf this row came from, e.g. "IN01/IN0101/IN010101/IN010101001". */
+  /** The bucket this row was swept from — "IN01" at level 1, up to
+   * "IN01/IN0101/IN010101/IN010101001" at level 4. */
   industryPath: string;
-  /** Screener's label for that leaf, e.g. "Commodity Chemicals". */
+  /** Screener's label for that bucket: a sector ("Consumer Discretionary") at
+   * level 1, a specific industry ("Commodity Chemicals") at level 4. Read off the
+   * page's own heading, so it is whatever Screener calls that bucket. */
   industryName: string;
+  /** How many taxonomy levels `industryPath` carries, 1-4. Says how specific
+   * `industryName` is; a level-1 sweep cannot report the leaf industry. */
+  industryLevel: number;
   /** Screener's internal company id, from the row's data-row-company-id. */
   companyId: number | null;
 }
@@ -141,18 +176,35 @@ function txt(el: HTMLElement | null | undefined): string {
   return (el?.text ?? "").replace(/\s+/g, " ").trim();
 }
 
-/** Leaf paths from /market/, e.g. "IN01/IN0101/IN010101/IN010101001". Extracted
- * rather than hardcoded so a reorganised taxonomy is picked up on the next sweep;
- * /market/ links only leaves, so a 4-level shape is the whole filter we need. */
-export function parseIndustryIndex(html: string): { path: string; name: string }[] {
+/** A page to sweep: a taxonomy path plus, when we know it, Screener's label. */
+export interface IndustryBucket {
+  path: string;
+  /** Empty when only the code is known — /market/ links leaf anchors only, so a
+   * rolled-up prefix has no anchor text and its name comes off its own page. */
+  name: string;
+}
+
+/**
+ * Buckets to sweep, from the /market/ index.
+ *
+ * Extracted rather than hardcoded so a reorganised taxonomy is picked up on the
+ * next sweep. /market/ links only 4-level leaves, so `level` rolls those paths up
+ * to their prefixes: level 1 dedupes 188 leaves down to the 12 sector codes. The
+ * prefixes are not linked anywhere but are live URLs serving the union of their
+ * children, so rolling up costs no extra request and loses no company.
+ */
+export function parseIndustryIndex(html: string, level: SweepLevel = 4): IndustryBucket[] {
   const seen = new Set<string>();
-  const out: { path: string; name: string }[] = [];
+  const out: IndustryBucket[] = [];
   for (const a of parse(html).querySelectorAll("a[href^='/market/']")) {
     const href = a.getAttribute("href") ?? "";
     const m = href.match(/^\/market\/(IN\d+\/IN\d+\/IN\d+\/IN\d+)\/$/);
-    if (!m || seen.has(m[1])) continue;
-    seen.add(m[1]);
-    out.push({ path: m[1], name: txt(a) || m[1] });
+    if (!m) continue;
+    const path = m[1].split("/").slice(0, level).join("/");
+    if (seen.has(path)) continue;
+    seen.add(path);
+    // Anchor text names the leaf, so it only describes a full-depth path.
+    out.push({ path, name: level === 4 ? txt(a) || path : "" });
   }
   return out;
 }
@@ -161,12 +213,27 @@ export interface IndustryPage {
   rows: MarketRow[];
   /** Screener's verbatim column labels, first header block only. */
   columns: string[];
-  /** From the "<N> results found" line — the leaf's true company count. */
+  /** From the "<N> results found" line — the bucket's true company count. */
   resultsFound: number | null;
+  /** The bucket's name per its own `<h1>`, e.g. "Consumer Discretionary". Null if
+   * the heading is missing. This is how a rolled-up path gets a label at all. */
+  heading: string | null;
+}
+
+/** Screener titles these pages "<Name> Companies"; the suffix is noise on every
+ * one of them, so it is dropped to leave the name a caller would recognise. */
+function headingName(root: HTMLElement): string | null {
+  const h = txt(root.querySelector("h1"));
+  if (h === "") return null;
+  return h.replace(/\s+Companies$/i, "").trim() || null;
 }
 
 /**
- * Parse one leaf industry page (or, identically, a /screen/raw/ page).
+ * Parse one industry page — leaf, rolled-up sector, or (identically) a
+ * /screen/raw/ page.
+ *
+ * `industryName` may be empty: a rolled-up path has no anchor text anywhere, so
+ * the page's own `<h1>` is the only label available and is used as the fallback.
  *
  * Two quirks drive the shape of this. The header block is repeated every few
  * rows inside a single `<tbody>`, so the first `<tr>` carrying `<th>`s is the
@@ -183,7 +250,10 @@ export function parseIndustryPage(
   const root = parse(html);
   const table = root.querySelector("table");
   const resultsFound = num(html.match(/([\d,]+)\s*results?\s*found/i)?.[1] ?? null);
-  if (!table) return { rows: [], columns: [], resultsFound };
+  const heading = headingName(root);
+  const label = industryName || heading || industryPath;
+  const industryLevel = industryPath.split("/").length;
+  if (!table) return { rows: [], columns: [], resultsFound, heading };
 
   const headerRow = table.querySelectorAll("tr").find((tr) => tr.querySelectorAll("th").length > 1);
   const ths = headerRow?.querySelectorAll("th") ?? [];
@@ -221,13 +291,14 @@ export function parseIndustryPage(
       slug,
       name: txt(link),
       industryPath,
-      industryName,
+      industryName: label,
+      industryLevel,
       companyId: id ? Number(id) : null,
       ...metrics,
     });
   }
 
-  return { rows, columns, resultsFound };
+  return { rows, columns, resultsFound, heading };
 }
 
 // ---------------------------------------------------------------------------
@@ -354,8 +425,22 @@ export interface FetchUniverseOptions {
   delayMs?: number;
   /** Attempts per page, including the first. */
   attemptsPerPage?: number;
-  /** Safety valve for a pathologically large leaf. */
+  /** Safety valve for a pathologically large bucket. Level-1 buckets run to 57
+   * pages today (Consumer Discretionary, 1,402 companies), so this has to clear
+   * that comfortably; at level 4 no leaf exceeds 15. */
   maxPagesPerIndustry?: number;
+  /** Taxonomy depth to address. Defaults to 1 (12 sector pages). Raise to 4 for
+   * leaf-accurate `industryName` at ~50% more requests. */
+  level?: SweepLevel;
+  /**
+   * Stop paging a bucket once its rows fall below this market cap, Rs. Cr.
+   *
+   * Safe only because every page is cap-descending; the resulting universe is
+   * PARTIAL by design and `Universe.minMarketCapCr` records the floor so no
+   * caller can mistake it for the whole market. This is the single biggest lever
+   * on sweep time: 31 pages at 10,000 Cr against 223 at 0.
+   */
+  minMarketCapCr?: number;
   onProgress?: (p: UniverseProgress) => void;
 }
 
@@ -372,9 +457,19 @@ export interface Universe {
    * the missing leaves without resetting the TTL clock on the rows already held. */
   fetchedAt: string;
   fromCache: boolean;
-  /** Leaves we never managed to read. Non-empty means `rows` is missing companies,
+  /** Buckets we never managed to read. Non-empty means `rows` is missing companies,
    * which a caller must disclose rather than present as a small market. */
   failedIndustries: { path: string; name: string; reason: string }[];
+  /** Taxonomy depth swept, so a caller can tell how specific `industryName` is. */
+  sweepLevel: SweepLevel;
+  /**
+   * The market-cap floor this sweep stopped at, Rs. Cr. 0 means complete.
+   *
+   * Above 0, `rows` deliberately omits smaller companies, so `rows.length` is NOT
+   * the size of the market. It is also the cache-reuse key: a universe swept to
+   * floor F answers any query whose own floor is >= F, and nothing below it.
+   */
+  minMarketCapCr: number;
 }
 
 /**
@@ -404,9 +499,23 @@ function ttlMs(opt?: number): number {
 function readCache(maxAgeMs: number): Universe | null {
   try {
     const c = JSON.parse(readFileSync(universeCachePath(), "utf8")) as CacheFile;
-    if (c.version !== CACHE_VERSION || !Array.isArray(c.rows) || c.rows.length === 0) return null;
+    if (!Array.isArray(c.rows) || c.rows.length === 0) return null;
     const age = Date.now() - Date.parse(c.fetchedAt);
     if (!Number.isFinite(age) || age > maxAgeMs) return null;
+    // A v1 file predates rolled-up sweeps, so it is a complete level-4 one by
+    // construction. Migrating beats discarding: it is the most complete universe
+    // this module can produce, and re-earning it costs 334 requests.
+    if (c.version === 1) {
+      return {
+        ...c,
+        sweepLevel: 4,
+        minMarketCapCr: 0,
+        rows: c.rows.map((r) => ({ ...r, industryLevel: r.industryPath.split("/").length })),
+        fromCache: true,
+        pagesFetched: 0,
+      };
+    }
+    if (c.version !== CACHE_VERSION) return null;
     return { ...c, fromCache: true, pagesFetched: 0 };
   } catch {
     return null; // absent, truncated, or hand-edited — just re-sweep
@@ -425,17 +534,27 @@ function writeCache(u: Universe): void {
   }
 }
 
-/** Page through one leaf. */
+/**
+ * Page through one bucket.
+ *
+ * `minMarketCapCr` above 0 truncates the walk. Every page is cap-descending, so
+ * once a page ends below the floor every later page is too and there is nothing
+ * left worth fetching. The check reads the page's smallest *non-null* cap: a blank
+ * cap cell means unknown, which can never satisfy a floor clause but must not be
+ * read as zero and stop the walk early either.
+ */
 async function fetchIndustry(
-  industry: { path: string; name: string },
+  industry: IndustryBucket,
   maxPages: number,
   delayMs: number,
   attempts: number,
+  minMarketCapCr = 0,
 ): Promise<IndustryPage & { pagesFetched: number }> {
   const rows: MarketRow[] = [];
   const seen = new Set<string>();
   let columns: string[] = [];
   let resultsFound: number | null = null;
+  let heading: string | null = null;
   let pagesFetched = 0;
 
   for (let page = 1; page <= maxPages; page++) {
@@ -447,6 +566,7 @@ async function fetchIndustry(
     pagesFetched++;
     if (columns.length === 0) columns = parsed.columns;
     resultsFound ??= parsed.resultsFound;
+    heading ??= parsed.heading;
 
     const fresh = parsed.rows.filter((r) => !seen.has(r.slug));
     for (const r of fresh) {
@@ -457,32 +577,53 @@ async function fetchIndustry(
     // Out-of-range pages neither 404 nor come back empty: Screener CLAMPS to the
     // last page and re-serves it (?page=100 on a 74-row leaf returns rows 51-74).
     // So "no new slugs" is the real terminator; the empty and short-page checks
-    // are belt-and-braces for leaves that behave differently.
+    // are belt-and-braces for buckets that behave differently.
     if (fresh.length === 0) break;
     if (parsed.rows.length < ROWS_PER_PAGE) break;
     if (resultsFound !== null && rows.length >= resultsFound) break;
+    if (minMarketCapCr > 0) {
+      const caps = parsed.rows.map((r) => r.marketCapCr).filter((v): v is number => v !== null);
+      // Strictly below, so a bucket whose rows sit exactly on the floor still pages
+      // on — `>= floor` queries need those and they may span a page boundary.
+      if (caps.length > 0 && Math.min(...caps) < minMarketCapCr) break;
+    }
     await sleep(delayMs);
   }
 
-  return { rows, columns, resultsFound, pagesFetched };
+  return { rows, columns, resultsFound, heading, pagesFetched };
 }
 
 /**
- * Every company Screener publishes, swept from the public industry browser.
+ * Every company Screener publishes above `minMarketCapCr`, swept from the public
+ * industry browser.
  *
- * Measured 2026-09-04: 188 leaves, 336 requests, 5,438 companies, 449 s at the
- * default pacing. Minutes, not seconds — so the result is cached on disk for 12h
- * and callers should pass `onProgress` to report "142/188 industries" meanwhile.
+ * Request counts, all measured against the live site and its ~0.77 req/s pacing:
  *
- * A partial sweep is cached too, and the next call *repairs* it: only the leaves
- * that failed are re-fetched, and the original `fetchedAt` is kept so repairs
- * cannot refresh the TTL of rows that are actually a day old. That makes a
- * throttled sweep converge over a few calls instead of restarting from zero and
- * re-hammering the 180 leaves that already worked.
+ *   level 4, no floor   334 pages   449 s   (what this did before)
+ *   level 1, no floor   223 pages   ~300 s
+ *   level 1, floor 1000  70 pages    ~94 s
+ *   level 1, floor 10000 31 pages    ~42 s
+ *
+ * So the floor, not the pacing, is what makes this quick — and the pacing is left
+ * exactly where it was measured safe. Still slow enough to cache for 12h and to
+ * want `onProgress` reporting "7/12 sectors" meanwhile.
+ *
+ * A partial sweep is cached too, and the next call *repairs* it: only the buckets
+ * that failed are re-fetched, at the floor the original sweep used, and the
+ * original `fetchedAt` is kept so repairs cannot refresh the TTL of rows that are
+ * actually a day old. That makes a throttled sweep converge over a few calls
+ * instead of restarting from zero and re-hammering what already worked.
+ *
+ * The cache is only reused when it reaches at least as deep as this call needs
+ * (`cached.minMarketCapCr <= minMarketCapCr`). Asking for a lower floor than the
+ * cache holds re-sweeps rather than answering from a universe that is missing the
+ * very companies the caller just widened the query to include.
  */
 export async function fetchUniverse(opts: FetchUniverseOptions = {}): Promise<Universe> {
   const {
     force = false,
+    level = DEFAULT_SWEEP_LEVEL,
+    minMarketCapCr = 0,
     // Both measured 2026-09-04. 4-in-flight with a 200 ms gap (~6 req/s) earned
     // an HTTP 429 inside ~30 requests and then a TCP-level block of this IP that
     // lasted ~57 minutes. 2-in-flight with a 2 s gap (~0.75 req/s) completed all
@@ -492,19 +633,27 @@ export async function fetchUniverse(opts: FetchUniverseOptions = {}): Promise<Un
     concurrency = 2,
     delayMs = 2000,
     attemptsPerPage = 4,
-    maxPagesPerIndustry = 40,
+    // Level-1 buckets are large: Consumer Discretionary is 1,402 companies, 57
+    // pages. 120 leaves headroom for growth without letting a misparse page
+    // forever.
+    maxPagesPerIndustry = 120,
     onProgress,
   } = opts;
 
-  const cached = force ? null : readCache(ttlMs(opts.ttlHours));
+  const fresh = force ? null : readCache(ttlMs(opts.ttlHours));
+  // A shallower cache cannot answer a deeper question; re-sweep instead.
+  const cached = fresh && fresh.minMarketCapCr <= minMarketCapCr ? fresh : null;
   if (cached && cached.failedIndustries.length === 0) return cached;
 
-  // Repair pass: keep what we have and retry only the gaps. Otherwise start from
+  // Repair pass: keep what we have and retry only the gaps, at the floor that
+  // sweep used so the result stays internally consistent. Otherwise start from
   // /market/, which is also how a changed taxonomy gets picked up.
   const repairing = cached !== null;
+  const floor = repairing ? cached.minMarketCapCr : minMarketCapCr;
+  const sweepLevel = repairing ? cached.sweepLevel : level;
   const todo = repairing
     ? cached.failedIndustries.map(({ path, name }) => ({ path, name }))
-    : parseIndustryIndex(await fetchMarketHtml("/market/"));
+    : parseIndustryIndex(await fetchMarketHtml("/market/"), level);
   if (todo.length === 0) {
     throw new Error("Screener /market/ listed no industry pages — the page layout may have changed");
   }
@@ -528,12 +677,20 @@ export async function fetchUniverse(opts: FetchUniverseOptions = {}): Promise<Un
       });
     } else {
       try {
-        const page = await fetchIndustry(industry, maxPagesPerIndustry, delayMs, attemptsPerPage);
+        const page = await fetchIndustry(
+          industry,
+          maxPagesPerIndustry,
+          delayMs,
+          attemptsPerPage,
+          floor,
+        );
         pagesFetched += page.pagesFetched;
         consecutiveFailures = 0;
         if (columns.length === 0) columns = page.columns;
         if (page.rows.length > 0) leavesVisited++;
-        // A company can be listed under more than one leaf; first one wins so a
+        // A rolled-up path has no anchor text, so the page heading is its label.
+        if (industry.name === "") industry.name = page.heading ?? industry.path;
+        // A company can be listed under more than one bucket; first one wins so a
         // row's industryPath stays stable across sweeps.
         for (const r of page.rows) {
           if (bySlug.has(r.slug)) continue;
@@ -569,6 +726,8 @@ export async function fetchUniverse(opts: FetchUniverseOptions = {}): Promise<Un
     fetchedAt: cached?.fetchedAt ?? new Date().toISOString(),
     fromCache: false,
     failedIndustries,
+    sweepLevel,
+    minMarketCapCr: floor,
   };
   if (rows.length > 0) writeCache(universe);
   return universe;
@@ -647,6 +806,25 @@ export function parseQuery(query: string): ParsedQuery {
   return { clauses, unapplied };
 }
 
+/**
+ * The market-cap floor implied by a query, Rs. Cr., or 0 if it has none.
+ *
+ * This is what lets a screen cost 31 requests instead of 223, so it has to be
+ * conservative in one direction only: never claim a floor the query does not
+ * really impose. `>`, `>=` and `=` all bound from below, and taking `>` as
+ * inclusive is deliberately slack — it can only make the sweep fetch one page
+ * more than strictly needed. `<`, `<=` bound from above and imply nothing.
+ * Several floors mean the tightest wins.
+ */
+function marketCapFloor(clauses: Clause[]): number {
+  let floor = 0;
+  for (const c of clauses) {
+    if (c.field !== "marketCapCr") continue;
+    if (c.op === ">" || c.op === ">=" || c.op === "=") floor = Math.max(floor, c.value);
+  }
+  return floor > 0 ? floor : 0;
+}
+
 function passes(row: MarketRow, c: Clause): boolean {
   const v = row[c.field];
   // A blank cell is unknown, not zero. Excluding it is the only safe reading:
@@ -681,6 +859,12 @@ export interface AnonymousScreenResult extends ScreenResult {
   /** How many companies were screened, and when they were fetched. */
   universeSize: number;
   universeFetchedAt: string;
+  /** The market-cap floor the universe was swept to, Rs. Cr. Above 0, `universeSize`
+   * counts only companies at or above it — it is not the size of the market. */
+  universeMinMarketCapCr: number;
+  /** Taxonomy depth swept: 1 means `industryName` on each row is a sector rather
+   * than a specific industry. */
+  universeSweepLevel: number;
   appliedClauses: string[];
   /** Clauses that were NOT evaluated. Non-empty means `rows` is a superset. */
   unappliedClauses: string[];
@@ -710,6 +894,12 @@ export interface ScreenAnonymouslyOptions extends FetchUniverseOptions {
  * Throws `UnsupportedQueryError` when no clause at all could be applied — the
  * alternative, handing back the whole universe labelled as a screen result, is
  * the exact false confidence this module exists to avoid.
+ *
+ * A market-cap clause in the query pays for itself: it becomes the sweep's floor,
+ * which is the difference between a ~40 s first call and a ~5 min one. Callers who
+ * want that speed without such a clause can set `minMarketCapCr` explicitly, which
+ * is then applied as a filter as well as a floor so the answer does not depend on
+ * how deep the cache happens to reach.
  */
 export async function screenAnonymously(
   query: string,
@@ -726,7 +916,22 @@ export async function screenAnonymously(
     );
   }
 
-  const universe = opts.universe ?? (await fetchUniverse(opts));
+  // An explicit floor above the query's own narrows the answer, so it is recorded
+  // as a real clause: `appliedClauses` shows it, and the rows are the same whether
+  // the universe came from a floored sweep or a complete cache.
+  const queryFloor = marketCapFloor(clauses);
+  const askedFloor = Math.max(0, opts.minMarketCapCr ?? 0);
+  if (askedFloor > queryFloor) {
+    clauses.push({
+      text: `Market Capitalization >= ${askedFloor}`,
+      field: "marketCapCr",
+      op: ">=",
+      value: askedFloor,
+    });
+  }
+  const floor = Math.max(queryFloor, askedFloor);
+
+  const universe = opts.universe ?? (await fetchUniverse({ ...opts, minMarketCapCr: floor }));
   const matched = universe.rows.filter((r) => clauses.every((c) => passes(r, c)));
 
   // Sort key: default to market cap desc, which is what the industry pages
@@ -789,6 +994,16 @@ export async function screenAnonymously(
     `Screened locally against ${universe.rows.length} companies from Screener's public industry ` +
       `pages (fetched ${universe.fetchedAt}${universe.fromCache ? ", from cache" : ""}). No login used.`,
   );
+  if (universe.minMarketCapCr > 0) {
+    parts.push(
+      `That universe covers only companies at or above ${universe.minMarketCapCr} Cr market cap — ` +
+        `the sweep stopped there because the query cannot match anything smaller, so ` +
+        `universeSize is not the size of the market.`,
+    );
+  }
+  if (universe.sweepLevel < 4) {
+    parts.push(`industryName is a sector, not a specific industry (swept at level ${universe.sweepLevel}).`);
+  }
 
   return {
     query,
@@ -799,6 +1014,8 @@ export async function screenAnonymously(
     rows,
     universeSize: universe.rows.length,
     universeFetchedAt: universe.fetchedAt,
+    universeMinMarketCapCr: universe.minMarketCapCr,
+    universeSweepLevel: universe.sweepLevel,
     appliedClauses: clauses.map((c) => c.text),
     unappliedClauses: unapplied.map((u) => u.text),
     note: parts.join(" "),
