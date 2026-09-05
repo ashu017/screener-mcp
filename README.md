@@ -1,8 +1,9 @@
 # screener-mcp
 
 An [MCP](https://modelcontextprotocol.io) server exposing **Screener.in** data for
-Indian stocks (NSE/BSE) — fundamentals, financial statements, peers, and price/EPS
-time-series — as tools any MCP client (Claude, etc.) can call.
+Indian stocks (NSE/BSE) — fundamentals, financial statements, peers, price/EPS
+time-series, and **stock screening that works without an account** — as tools any
+MCP client (Claude, etc.) can call.
 
 Screener.in is server-rendered (Django), so most data comes from a single HTML GET;
 the chart tool uses Screener's JSON chart API.
@@ -17,8 +18,12 @@ the chart tool uses Screener's JSON chart API.
 | `get_chart` | `symbol`, `metric?`, `days?` | Time-series from the chart API. `metric` e.g. `Price-DMA50-Volume`, `Price`, `Quarter Sales`, `EPS` |
 | `get_ratios` | `symbol` | The same fundamentals as **typed numbers** (`pe`, `pb`, `roe`, `roce`, `debtEquity`, `salesGrowth3yPct`, `promoterHoldingPct`, …) rather than display strings |
 | `get_quarterly_results` | `symbol` | Per-quarter Sales / Net Profit / EPS / OPM keyed by ISO quarter-end date |
-| `run_screen` | `query`, `maxPages?`, `sort?`, `order?` | Stocks matching a Screener DSL query. **Needs sign-in** |
-| `screener_auth_status` | — | Whether a signed-in Screener session is present and still valid (see [Signing in](#signing-in-optional)) |
+| `screen_stocks` | `query`, `limit?`, `sort?`, `order?`, `refresh?` | Screens **~5,400 companies with no sign-in**. Nine metrics; see [Screening](#screening) |
+| `get_public_screen` | `screen`, `maxPages?`, `sort?`, `order?` | Reads a **saved** screen by id or URL, no sign-in. Also returns the screen's own DSL |
+| `build_screen_link` | `query` | A link the *user* clicks to run any query in their own signed-in browser, plus the words to send with it |
+| `list_public_screens` | `page?`, `maxPages?` | Screener's directory of public screens, for finding one that already exists |
+| `run_screen` | `query`, `maxPages?`, `sort?`, `order?` | Screener's own DSL endpoint — the full ratio vocabulary. **Needs sign-in** |
+| `screener_auth_status` | — | Four-state sign-in report with an instruction to relay. See [Signing in](#signing-in-optional) |
 
 `get_fundamentals` returns what Screener displays (`"₹ 17,60,650 Cr."`); `get_ratios` returns
 what you can compute with (`marketCapCr: 1760650`). Reach for `get_ratios` when comparing or
@@ -28,9 +33,67 @@ Banks and NBFCs get `null` for `debtEquity` and `salesGrowth3yPct` on purpose �
 "Borrowings" are customer deposits and their "Sales" is interest income, so those ratios
 don't mean what they mean elsewhere. `isFinancialCompany` and `caveats` say when this applied.
 
-### Screens
+## Screening
 
-`run_screen` takes Screener's own filter DSL and pages through the results (50 per page):
+Screener gates its DSL endpoint (`/screen/raw/`) behind a login, so there are three routes
+to a screen. **Start with `screen_stocks`** — it needs no account at all.
+
+### `screen_stocks` — no account, whole market
+
+Screener publishes the same table a screen renders on its 188 public industry pages under
+`/market/`. `screen_stocks` sweeps them into a local cache — **5,438 companies** as of
+2026-09-04, from Bharti Airtel down to sub-crore microcaps — and evaluates your query
+against all of it. That's the whole listed universe, not 50 rows a page.
+
+```
+Return on capital employed > 15 AND Market Capitalization > 10000
+  AND YOY Quarterly profit growth > 20
+```
+
+The trade is vocabulary. Only these nine metrics exist anonymously:
+
+`Current price` · `Price to Earning` · `Market Capitalization` · `Dividend yield` ·
+`Net Profit latest quarter` · `YOY Quarterly profit growth` · `Sales latest quarter` ·
+`YOY Quarterly sales growth` · `Return on capital employed`
+
+A clause on anything else — ROE, debt/equity, Piotroski, promoter holding, 3-year growth —
+is **not silently dropped**. It comes back in `unappliedClauses`, the rows are labelled a
+*superset* of your query, and `note` says so in plain language. The intended workflow is
+"narrow here, then call `get_ratios` per shortlisted symbol to check the rest". A query
+where *nothing* applies throws rather than handing back 5,438 rows dressed up as a result.
+
+Only `AND` is supported; `OR` and parentheses land in `unappliedClauses` too.
+
+**The first call builds the cache and takes several minutes** (188 leaves, ~336 requests,
+~450 s at the default deliberate pacing). It's cached for 12 h after that, so later calls
+return instantly. Progress goes to stderr, which most MCP clients surface as server logs.
+
+### `build_screen_link` + `get_public_screen` — any query, still no credential
+
+When a query needs a metric `screen_stocks` lacks, don't ask the user for a cookie — hand
+them a link. `build_screen_link` mints a `/screen/new/?query=…` URL and the words to send
+with it. Their browser is already signed in to Screener, so the screen runs *there*.
+
+Once they save it, the screen lives at `/screens/<id>/<slug>/`, which is **readable
+anonymously, with pagination, and doesn't expire**. They paste that address back and
+`get_public_screen` can read it forever. One click converts a login-gated query into a
+permanent public read.
+
+`get_public_screen` is liberal about what it accepts — a bare id, a full URL, a URL with a
+`?page=2` tail, a missing scheme — because that's where a non-technical user's copy-paste
+lands. It also returns the screen's own DSL in `query`, so you can see what a saved screen
+actually filters on.
+
+One limit, measured rather than assumed: **`?sort=` is login-gated**, and the gate is on the
+parameter rather than its value (`?sort=name` redirects too), while `?page=` passes and
+`?order=` passes but is then ignored. So there is no anonymous ordering lever. `sort` raises
+an auth error instead of sorting whichever 25 rows happened to be fetched and calling them
+the top. To get "the biggest in this screen" anonymously, raise `maxPages` to cover the
+screen and order the rows yourself.
+
+### `run_screen` — the full vocabulary, with sign-in
+
+Screener's own DSL endpoint, 50 rows per page, every ratio it supports:
 
 ```
 Return on capital employed > 15 AND Debt to equity < 1
@@ -38,10 +101,10 @@ Return on capital employed > 15 AND Debt to equity < 1
 ```
 
 This is the one tool that **requires sign-in** — Screener redirects anonymous callers to
-`/register/`. It's dramatically cheaper than calling `get_ratios` over a whole universe: one
-paged request replaces hundreds of per-stock fetches.
+`/register/`. Use it when `screen_stocks` can't express the query.
 
-`symbol` is the NSE/BSE trading symbol, e.g. `TCS`, `RELIANCE`, `MTARTECH`.
+`symbol` is the NSE/BSE trading symbol, e.g. `TCS`, `RELIANCE`, `MTARTECH`. Every screening
+tool returns a `slug` per row that works as `symbol` for the others.
 
 ## Use it (no setup)
 
@@ -65,68 +128,84 @@ Or, from Claude Code:
 claude mcp add screener -- npx -y screener-mcp
 ```
 
-Then an agent can call `get_fundamentals`, `get_financials`, `get_peers`, `get_chart`.
+That's the whole setup. Fundamentals, financials, peers, charts and `screen_stocks` all
+work immediately, with no account.
 
-To pin a version, use `screener-mcp@0.1.0`. To run straight from git without npm:
+To pin a version, use `screener-mcp@0.2.0`. To run straight from git without npm:
 `npx -y github:ashu017/screener-mcp` (builds on install via the `prepare` script).
 
 ## Signing in (optional)
 
-Screener serves more to logged-in accounts. Screener has no OAuth or API keys — it's a
-Django app, so being "signed in" means holding a `sessionid` cookie. Two ways to get one:
+Sign-in buys exactly one thing: `run_screen`'s full ratio vocabulary. Everything else,
+screening included, works anonymously — so treat this as optional.
+
+Screener has no OAuth or API keys. It's a Django app, so being "signed in" means holding a
+`sessionid` cookie. Three ways to get one:
 
 ```bash
+npx screener-mcp login --chrome     # opens the Chrome you already have (easiest)
+npx screener-mcp login --browser    # same, via a browser Playwright downloads
 npx screener-mcp login              # email + password, prompted with no echo
-npx screener-mcp login --browser    # sign in in a real browser window
 npx screener-mcp status             # is my session still valid?
 npx screener-mcp logout             # delete it
 ```
 
-Either way, only the returned cookie is kept, in `~/.config/screener-mcp/session.json` at
-mode `0600` — never a password, never anything in an MCP config file. All the read-only
-tools work anonymously; sign-in adds `run_screen` and account-gated data.
+Only the returned cookie is kept, in `~/.config/screener-mcp/session.json` at mode `0600` —
+never a password, never anything in an MCP config file. The session outlives the server
+process, so you log in once, not per MCP session.
 
-The session outlives the server process, so you log in once, not per MCP session. When the
-cookie expires, tools return an instruction to re-run `login` instead of failing obscurely —
-and agents can call `screener_auth_status` to check deliberately.
+When the cookie expires, tools return an instruction to re-run `login` instead of failing
+obscurely, and agents can call `screener_auth_status` deliberately. That tool reports **four**
+states, not two: `active`, `anonymous`, `expired`, and `unknown` — the last meaning Screener
+couldn't be reached, so it is *not* a sign-in problem and the user shouldn't be sent to log
+in again over a dropped connection. Each state carries an `instruction` written to be relayed
+verbatim, including the case where `SCREENER_SESSION_ID` is the thing that expired and running
+`login` therefore won't help.
+
+### `login --chrome` (recommended)
+
+Drives the Chrome, Chromium, Edge or Brave **already installed on your machine** over the
+DevTools Protocol. Nothing to download, and no new dependency in this package — it uses
+Node's built-in WebSocket.
+
+It opens Screener's login page in a browser profile of its own, kept at
+`~/.config/screener-mcp/browser-profile` (mode `0700`), so your everyday tabs, bookmarks and
+history are untouched. You sign in however you normally do; it watches for `sessionid`,
+verifies it, saves it, and closes the browser. Nothing you type passes through the CLI.
+
+Two requirements: **Node 22+** (older versions have no built-in WebSocket) and a display.
+The server itself still runs on Node 18 — this limit applies only to `--chrome`.
+
+It reads `sessionid` even though the cookie is `HttpOnly`, which a browser console could not
+do, and captures `csrftoken` alongside it. It never touches your default Chrome profile:
+Chrome 136+ refuses remote debugging there outright, and the consent-gated path Chrome 144
+added needs a checkbox in `chrome://inspect` plus an Allow dialog on *every* run — a harder
+and scarier ask than signing in once in a fresh window.
+
+### `login --browser`
+
+The same flow through Playwright, which downloads its own Chromium. Use it if `--chrome`
+can't find a browser. Needs **Playwright** — not a dependency of this package, since it
+pulls a several-hundred-megabyte browser and most installs only ever run the server:
+
+```bash
+npm install playwright && npx playwright install chromium
+```
+
+It's looked up in your working directory and the global npm root; `SCREENER_PLAYWRIGHT_PATH`
+points at it anywhere else. Needs **Node 20+**.
 
 ### `login` (email + password)
 
 Posts once to Screener's own `/login/` form and keeps the `sessionid` it returns. Your
 password is used for that single request and is never stored or logged.
 
-### `login --browser`
-
-Screener also offers `/login/google/` and `/login/apple/`. **If you signed up with Google
-or Apple there is no password to post, so plain `login` cannot work for you** — use
-`--browser`.
-
-It opens a Chromium window at Screener's login page, you sign in however you normally do,
-and it watches the cookie jar until `sessionid` appears, then verifies it, saves it, and
-closes the browser. Nothing you type passes through the CLI. It reads `sessionid` even
-though the cookie is `HttpOnly` (a browser console could not), and captures `csrftoken`
-alongside it for future gated POSTs.
-
-The Chromium profile is kept at `~/.config/screener-mcp/browser-profile` (mode `0700`) so a
-Google/Apple sign-in survives between runs — refreshing an expired cookie later is one
-click, not a full re-auth. `logout` deletes the profile as well as the session.
-
-Two requirements, both only for `--browser`:
-
-- **Playwright**, which is *not* a dependency of this package (it pulls a
-  several-hundred-megabyte browser, and most installs only ever run the server):
-  `npm install playwright && npx playwright install chromium`. It's looked up in your
-  working directory and the global npm root; `SCREENER_PLAYWRIGHT_PATH` points at it
-  anywhere else. To reuse a Chrome you already have, install `playwright-core` instead and
-  set `SCREENER_BROWSER_EXECUTABLE`.
-- **Node 20+**, because Playwright requires it. The server itself still runs on Node 18.
-
-It also needs a display, so it won't work over a plain SSH session or on a headless cloud
-desktop — run it on the machine with your browser, or use the cookie-by-hand route below.
+Screener also offers `/login/google/` and `/login/apple/`. **If you signed up with Google or
+Apple there is no password to post, so this path cannot work for you** — use `--chrome`.
 
 ### Cookie by hand
 
-If neither path fits (headless host, or Screener puts a captcha in front of login), sign in
+If none of those fit (headless host, or Screener puts a captcha in front of login), sign in
 with a browser, take the `sessionid` value from DevTools → Application → Cookies, and pass
 it as an env var (this takes precedence over the stored file):
 
@@ -144,12 +223,14 @@ it as an env var (this takes precedence over the stored file):
 
 | Env var | Purpose |
 |---|---|
-| `SCREENER_SESSION_ID` | Use this cookie instead of the stored session |
-| `SCREENER_MCP_CONFIG_DIR` | Override where the session and browser profile are stored |
+| `SCREENER_SESSION_ID` | Use this cookie instead of the stored session. Overrides the file, so `login` can't replace an expired value here |
+| `SCREENER_MCP_CONFIG_DIR` | Override where the session, browser profile and universe cache are stored |
+| `SCREENER_UNIVERSE_TTL_HOURS` | How long `screen_stocks` reuses its cached sweep (default 12) |
 | `SCREENER_USERNAME` / `SCREENER_PASSWORD` | Non-interactive `login`, for CI/headless |
-| `SCREENER_BROWSER_EXECUTABLE` | Path to an existing Chrome for `--browser` |
+| `SCREENER_BROWSER_EXECUTABLE` | Path to the browser to use for `--chrome` or `--browser` |
 | `SCREENER_PLAYWRIGHT_PATH` | Path to a `playwright` module dir, if it isn't in cwd or the global npm root |
-| `SCREENER_BROWSER_HEADLESS` | Run `--browser` headless. Only refreshes an already signed-in profile — it cannot complete a first-time sign-in |
+| `SCREENER_BROWSER_HEADLESS` | Run browser login headless. Only refreshes an already signed-in profile — it cannot complete a first-time sign-in |
+| `SCREENER_USER_AGENT` | Override the User-Agent sent to Screener |
 
 Use your own account only, and note that automated access to account-gated pages is subject
 to [Screener's terms](https://www.screener.in/guides/terms/), which license the site's
@@ -199,8 +280,18 @@ so they are deterministic and don't hit the network.
 
 - Data is scraped from Screener.in for personal use. Respect their terms and don't hammer
   the site; cache results and rate-limit in your client.
+- **Screener will IP-block you at the TCP level**, with no 429 first — connections simply
+  stop being accepted. Measured: 4 concurrent requests at 200 ms spacing got a host blocked
+  for ~57 minutes after roughly 30 requests. `screen_stocks` therefore defaults to 2
+  concurrent with 2000 ms spacing, which swept all 188 industry pages untouched, and caches
+  the result for 12 h. Don't raise those without re-measuring.
+- `screener.in/robots.txt` disallows the `?page=`, `?sort=`, `?limit=` and `?q=` query
+  parameters. Paginating a screen or an industry page necessarily requests `?page=N`, so
+  `screen_stocks`, `get_public_screen` and `run_screen` do send disallowed query strings.
+  Page 1 is always fetched as the bare, allowed URL.
 - Selectors target Screener's current DOM; if Screener changes markup, the parsers
-  (`src/screener.ts`) may need updating. The fixture test will catch regressions.
+  (`src/screener.ts`, `src/market.ts`, `src/public-screens.ts`) may need updating. The
+  fixture test will catch regressions in the company-page parsers.
 
 ## License
 
