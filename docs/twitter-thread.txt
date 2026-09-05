@@ -1,0 +1,58 @@
+screener-mcp launch thread — plain text, no markdown. Copy one block per tweet.
+
+Before posting:
+  - Make post 1 true to what actually happened (stock, timeframe, which ratio was wrong).
+  - Push local commits first, or the repo link in post 6 shows a stale tree.
+  - Do NOT promise browser login (--browser) or anonymous screening. Neither is on npm yet.
+
+════════════════════════════════ 1/6 ════════════════════════════════
+
+Last month I asked an AI whether a midcap I was holding was expensive.
+
+It answered instantly. P/E, ROCE, debt, promoter holding — all of it, confidently.
+
+Then I opened Screener.in and checked.
+
+Almost every number was from a different financial year.
+
+════════════════════════════════ 2/6 ════════════════════════════════
+
+The model wasn't lying to me. It was remembering.
+
+Memory is not a data source.
+
+And for Indian small and midcaps it's worse, because there's barely anything there to remember in the first place.
+
+════════════════════════════════ 3/6 ════════════════════════════════
+
+So I went back to doing it by hand. Screen on Screener, get 180 names, open the interesting ones in tabs, copy ratios into a sheet.
+
+Somewhere around tab 30 I noticed I wasn't analysing anything anymore.
+
+I was doing data entry.
+
+════════════════════════════════ 4/6 ════════════════════════════════
+
+So I stopped asking the model to remember, and gave it the source instead.
+
+screener-mcp — an MCP server that reads Screener.in live. Fundamentals, financials, sector peers, quarterly results, price and EPS history.
+
+claude mcp add screener -- npx -y screener-mcp
+
+════════════════════════════════ 5/6 ════════════════════════════════
+
+One detail I cared about: a bank's "borrowings" are your deposits. Debt-to-equity is meaningless for them.
+
+Most data layers report it anyway.
+
+This one returns null for ratios that don't apply to financials — and tells the model why, so it doesn't guess.
+
+════════════════════════════════ 6/6 ════════════════════════════════
+
+It also returns every stock twice. Once the way Screener shows it, ₹ 17,60,650 Cr. — and once as marketCapCr: 1760650.
+
+Strings are for people. The model needs something it can sort.
+
+No API key, no signup. NSE + BSE. MIT.
+
+github.com/ashu017/screener-mcp
