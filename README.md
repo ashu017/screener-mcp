@@ -29,6 +29,14 @@ the chart tool uses Screener's JSON chart API.
 what you can compute with (`marketCapCr: 1760650`). Reach for `get_ratios` when comparing or
 grading stocks, `get_fundamentals` when showing a human the page as-is.
 
+Every company tool reads one page, preferring the **consolidated** view and falling back to
+standalone. The fallback triggers on an empty consolidated page as well as a 404, because
+Screener serves some consolidated views as a 200 whose statement tables carry row labels and
+no period columns at all — Netweb, Bharti Hexacom, KSH International and Dynamic Cables all
+render that way while their standalone pages hold 13 quarters. Without the emptiness check
+those companies come back with null ratios and zero quarters and *look* like real answers.
+`url` in the result says which view you actually got, which matters when comparing companies.
+
 Banks and NBFCs get `null` for `debtEquity` and `salesGrowth3yPct` on purpose — their
 "Borrowings" are customer deposits and their "Sales" is interest income, so those ratios
 don't mean what they mean elsewhere. `isFinancialCompany` and `caveats` say when this applied.

@@ -78,17 +78,52 @@ async function fetchHtml(path: string, what = path): Promise<string> {
   return res.text();
 }
 
-/** Screener is server-rendered (Django). One GET returns the full page. Prefer
- * the consolidated view; fall back to standalone if consolidated 404s. */
+/**
+ * True when a company page renders its statement tables with no period columns
+ * at all — the shape Screener serves for a consolidated view it has no data for.
+ *
+ * Such a page is a 200, not a 404, and it looks legitimate: the ratio cards and
+ * the statement tables are all present. But every card's number is missing (only
+ * the "₹"/"Cr." unit text survives) and every table carries its row labels with
+ * zero data columns, so `parseRatios` returns nulls and `parseQuarterlyResults`
+ * returns []. Measured on NETWEB, BHARTIHEXA, ESDS, KSHINTL and DYCL, whose
+ * standalone pages carry 13 quarters each.
+ *
+ * The period count is the signal rather than the empty ratio cards: a real page
+ * always has at least one period (1 label `<th>` + N periods), so exactly one
+ * `<th>` across every statement means no data, and a thinly-reported but real
+ * company still clears the bar.
+ */
+function hasNoReportedPeriods(html: string): boolean {
+  const root = parse(html);
+  const tables = ["quarters", "profit-loss", "balance-sheet"]
+    .map((id) => root.querySelectorAll(`#${id} table thead th`).length)
+    .filter((n) => n > 0);
+  return tables.length > 0 && tables.every((n) => n === 1);
+}
+
+/**
+ * Screener is server-rendered (Django). One GET returns the full page.
+ *
+ * Prefers the consolidated view and falls back to standalone, on an empty
+ * consolidated page as well as on a 404 — see `hasNoReportedPeriods`. If both
+ * views come back empty the consolidated one is returned, so this can only
+ * improve on the old behaviour, never lose a page it used to find.
+ */
 export async function fetchCompanyHtml(
   symbol: string,
 ): Promise<{ html: string; url: string }> {
   const sym = symbol.trim().toUpperCase();
+  let firstEmpty: { html: string; url: string } | null = null;
   for (const view of ["consolidated/", ""]) {
     const path = `/company/${encodeURIComponent(sym)}/${view}`;
     const res = await fetch(`${BASE}${path}`, { headers: headers() });
-    if (res.ok) return { html: await res.text(), url: `${BASE}${path}` };
+    if (!res.ok) continue;
+    const page = { html: await res.text(), url: `${BASE}${path}` };
+    if (!hasNoReportedPeriods(page.html)) return page;
+    firstEmpty ??= page;
   }
+  if (firstEmpty) return firstEmpty;
   throw new Error(`Screener: company '${sym}' not found (tried consolidated + standalone)`);
 }
 
